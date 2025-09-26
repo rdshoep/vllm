@@ -17,7 +17,6 @@ on:
       triton_candidates:
         description: "Triton versions (comma-separated)"
         required: true
-        # 对应 2.8.0 的常见区间，若不确定就保守多打包几个
         default: "3.2.0,3.3.0,3.4.0"
 
 jobs:
@@ -71,7 +70,7 @@ jobs:
               -d wheelhouse || true
           done
 
-      - name: (Optional) Download torch for smoke test
+      - name: "(Optional) Download torch 2.8.0+cu128 for offline smoke test"
         run: |
           CH=${{ steps.v.outputs.TORCH_CH }}
           TV=${{ steps.v.outputs.TORCH_VER }}
@@ -82,7 +81,6 @@ jobs:
               --python-version ${{ steps.v.outputs.PYTAG }} \
               -d wheelhouse
           else
-            # cu128 官方索引
             python -m pip download "torch==${TV}+${CH}" \
               --index-url "https://download.pytorch.org/whl/${CH}" \
               --platform ${{ steps.v.outputs.PLAT2 }} \
@@ -91,113 +89,127 @@ jobs:
               -d wheelhouse || true
           fi
 
-      - name: "Add installer & README"
+      - name: "Add offline installer (no network) & README"
         run: |
-          cat > install_triton_runtime.sh <<'SH'
+          cat > install_triton_offline.sh <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
           WHEEL_DIR="${1:-wheelhouse}"
-          echo "[1/4] Install toolchain (Ubuntu/WSL)..."
-          sudo apt update
-          sudo apt install -y build-essential pkg-config || true
-          # 优先装较新的 clang/llvm
-          if apt-cache policy clang-18 >/dev/null 2>&1; then
-            sudo apt install -y clang-18 llvm-18 lld-18
-            export CC=/usr/bin/clang-18; export CXX=/usr/bin/clang++-18; export PATH=/usr/lib/llvm-18/bin:$PATH
-          elif apt-cache policy clang-16 >/dev/null 2>&1; then
-            sudo apt install -y clang-16 llvm-16 lld-16
-            export CC=/usr/bin/clang-16; export CXX=/usr/bin/clang++-16; export PATH=/usr/lib/llvm-16/bin:$PATH
-          else
-            sudo apt install -y clang llvm lld
-            export CC=$(command -v clang); export CXX=$(command -v clang++)
-          fi
-          echo "[2/4] Verify compiler:"
-          $CC --version | head -n1 || true
 
-          echo "[3/4] (Optional) install torch from local wheel if present"
+          echo "[*] Offline install Triton from local wheelhouse: $WHEEL_DIR"
+          # 仅本地安装，不联网
           if ls "$WHEEL_DIR"/torch-*.whl >/dev/null 2>&1; then
+            echo " - Found local torch wheel; installing first..."
             python -m pip install --no-index --find-links "$WHEEL_DIR" torch || true
           fi
 
-          echo "[4/4] Try triton candidates until import OK..."
           ok=""
+          # 按版本号从高到低尝试安装第一个能 import 的 triton
           for whl in $(ls "$WHEEL_DIR"/triton-*.whl 2>/dev/null | sort -Vr); do
-            echo " -> installing $(basename "$whl")"
+            echo " - Trying $(basename "$whl")"
             if python -m pip install --no-index --find-links "$WHEEL_DIR" "$whl"; then
-              python - <<'PY' && ok="yes" || true
               if python - <<'PY'
                 import importlib
                 m = importlib.import_module("triton")
                 print("Imported Triton:", getattr(m, "__version__", "?"))
                 PY
-                then
-                  ok="yes"
-                else
-                  ok=""
-                fi
-              if [ "$ok" = "yes" ]; then
-                echo "Triton OK."; break
+              then
+                ok="yes"; break
               fi
             fi
           done
+
           if [ -z "$ok" ]; then
-            echo "No triton candidate imported. Check Python/ABI/torch version." >&2
+            echo "[-] Could not import Triton after local install. Check Python version and torch ABI." >&2
             exit 1
           fi
 
-          cat <<TIPS
+          cat <<'TIP'
 
-          Tips:
-          - Torch=CUDA 版 + 已安装 CUDA 12.8 (ptxas) 时，Triton/FA 才能走高性能 JIT。
-          - 若你只想先跑通、避免编译器：
+          [OK] Triton installed (offline).
+          如果你暂时不想依赖编译链（clang/ptxas），可以先让 vLLM 用 Torch 原语：
               export VLLM_USE_V1=1
               export VLLM_PRIMITIVE_BACKEND=TORCH
               unset VLLM_ATTENTION_BACKEND VLLM_USE_TRITON VLLM_USE_FLASH_ATTENTION VLLM_USE_FLASHINFER
-          - 建议安装 NVIDIA CUDA Toolkit 12.8（提供 ptxas），与驱动匹配更稳。
-          TIPS
+
+          真正启用 Triton/FA 获取更高性能时，请先在目标机离线安装编译链（见 install_toolchain_offline.sh）。
+          TIP
           SH
-          chmod +x install_triton_runtime.sh
+          chmod +x install_triton_offline.sh
 
           cat > README_TRITON.txt <<'TXT'
-          # Offline Triton bundle (Linux x86_64, Python 3.11)
-          1) 解压：tar -xzf triton_wheels.tgz
-          2) 在 WSL/Ubuntu 激活你的 Python 环境（与 torch 2.8.0 匹配）
-          3) 执行：bash install_triton_runtime.sh wheelhouse
-          4) 验证：python -c "import triton; print('triton', triton.__version__)"
-          5) 想避免编译链：设置 VLLM_USE_V1=1 与 VLLM_PRIMITIVE_BACKEND=TORCH（见脚本提示）
-          6) 想用 triton/FA：确保 torch=CUDA 版；最好安装 CUDA Toolkit 12.8（ptxas）。
+          # Offline Triton Install (NO NETWORK)
+          内容：
+            - wheelhouse/: triton 多版本 .whl（Linux x86_64, Py3.11），以及可选 torch 轮子
+            - install_triton_offline.sh：完全离线安装脚本（仅本地 wheel）
+          使用：
+            1) 把整个包拷到目标机；激活你的 Python 环境
+            2) 执行：bash install_triton_offline.sh wheelhouse
+            3) 验证：python -c "import triton; print(triton.__version__)"
+          想避免编译：
+            export VLLM_USE_V1=1; export VLLM_PRIMITIVE_BACKEND=TORCH
+          想启用 Triton/FA：
+            先离线安装编译链（见 toolchain_debs.tgz 内的 install_toolchain_offline.sh）
           TXT
 
-      - name: Smoke test (offline import)
+      - name: "Pack Triton artifact"
         run: |
-          python -m venv /tmp/off && source /tmp/off/bin/activate
-          python -m pip install -U pip
-          # 如有 torch 就装，便于后续环境一致
-          python -m pip install --no-index --find-links wheelhouse torch || true
-          # 试装最高版本的 triton
-          set +e
-          for whl in $(ls wheelhouse/triton-*.whl 2>/dev/null | sort -Vr); do
-            python -m pip install --no-index --find-links wheelhouse "$whl" && break
-          done
-          python - <<'PY'
-          try:
-            import triton
-            print("OK Triton", triton.__version__)
-          except Exception as e:
-            print("Import failed:", e)
-          PY
-
-      - name: Pack artifact
-        run: |
-          tar -czf triton_wheels.tgz wheelhouse install_triton_runtime.sh README_TRITON.txt
+          tar -czf triton_wheels.tgz wheelhouse install_triton_offline.sh README_TRITON.txt
           du -h triton_wheels.tgz
 
-      - name: Upload artifact
+      - name: "Upload Triton artifact"
         uses: actions/upload-artifact@v4
         with:
           name: triton_bundle_py${{ inputs.py_version }}_torch${{ inputs.torch_version }}_${{ inputs.torch_channel }}
           path: |
             triton_wheels.tgz
+            install_triton_offline.sh
             README_TRITON.txt
-            install_triton_runtime.sh
+          retention-days: 30
+
+      # === 可选：把编译链也预打包成 .deb（完全离线安装） ===
+      - name: "(Optional) Download toolchain .deb (offline install later)"
+        run: |
+          sudo apt-get update
+          # 下载但不安装，把 clang/llvm/lld/build-essential 及其依赖放进缓存
+          sudo apt-get install -y --download-only build-essential pkg-config
+          # clang-18 优先，不行就 clang-16
+          (sudo apt-get install -y --download-only clang-18 llvm-18 lld-18) || \
+          (sudo apt-get install -y --download-only clang-16 llvm-16 lld-16)
+          mkdir -p debs
+          cp -v /var/cache/apt/archives/*.deb debs/ || true
+
+      - name: "Add offline toolchain installer"
+        run: |
+          cat > install_toolchain_offline.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DEB_DIR="${1:-debs}"
+          echo "[*] Offline install toolchain from $DEB_DIR (*.deb only, no network)"
+          # 多轮 dpkg 安装，直到依赖满足
+          rounds=5
+          for i in $(seq 1 $rounds); do
+            echo " - dpkg round $i"
+            sudo dpkg -i "$DEB_DIR"/*.deb || true
+            # 如果还缺依赖会报错，继续下一轮；完全离线环境下不要调用 apt -f install
+          done
+          # 刷新链接库缓存
+          sudo ldconfig || true
+          echo "[OK] Toolchain installed (offline). Try:"
+          echo "  clang --version | head -n1"
+          SH
+          chmod +x install_toolchain_offline.sh
+
+      - name: "Pack Toolchain artifact"
+        run: |
+          tar -czf toolchain_debs.tgz debs install_toolchain_offline.sh
+          du -h toolchain_debs.tgz
+
+      - name: "Upload Toolchain artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolchain_debs_ubuntu2204
+          path: |
+            toolchain_debs.tgz
+            install_toolchain_offline.sh
           retention-days: 30
