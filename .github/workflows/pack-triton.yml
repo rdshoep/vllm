@@ -91,7 +91,7 @@ jobs:
               -d wheelhouse || true
           fi
 
-      - name: Add installer & README
+      - name: "Add installer & README"
         run: |
           cat > install_triton_runtime.sh <<'SH'
           #!/usr/bin/env bash
@@ -125,10 +125,16 @@ jobs:
             echo " -> installing $(basename "$whl")"
             if python -m pip install --no-index --find-links "$WHEEL_DIR" "$whl"; then
               python - <<'PY' && ok="yes" || true
-import importlib
-m = importlib.import_module("triton")
-print("Imported Triton:", getattr(m, "__version__", "?"))
-PY
+              if python - <<'PY'
+                import importlib
+                m = importlib.import_module("triton")
+                print("Imported Triton:", getattr(m, "__version__", "?"))
+                PY
+                then
+                  ok="yes"
+                else
+                  ok=""
+                fi
               if [ "$ok" = "yes" ]; then
                 echo "Triton OK."; break
               fi
@@ -174,12 +180,12 @@ PY
             python -m pip install --no-index --find-links wheelhouse "$whl" && break
           done
           python - <<'PY'
-try:
-    import triton
-    print("OK Triton", triton.__version__)
-except Exception as e:
-    print("Import failed:", e)
-PY
+          try:
+            import triton
+            print("OK Triton", triton.__version__)
+          except Exception as e:
+            print("Import failed:", e)
+          PY
 
       - name: Pack artifact
         run: |
