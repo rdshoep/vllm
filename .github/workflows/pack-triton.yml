@@ -1,0 +1,197 @@
+name: pack-triton-wheel
+on:
+  workflow_dispatch:
+    inputs:
+      py_version:
+        description: "Python tag (311 for Py3.11)"
+        required: true
+        default: "311"
+      torch_version:
+        description: "Torch version (no +cu, e.g. 2.8.0)"
+        required: true
+        default: "2.8.0"
+      torch_channel:
+        description: "Torch channel: cu128 | cpu"
+        required: true
+        default: "cu128"
+      triton_candidates:
+        description: "Triton versions (comma-separated)"
+        required: true
+        # 对应 2.8.0 的常见区间，若不确定就保守多打包几个
+        default: "3.2.0,3.3.0,3.4.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vars
+        id: v
+        run: |
+          echo "PLAT1=manylinux_2_35_x86_64" >> $GITHUB_OUTPUT
+          echo "PLAT2=manylinux2014_x86_64" >> $GITHUB_OUTPUT
+          echo "PYTAG=${{ inputs.py_version }}" >> $GITHUB_OUTPUT
+          echo "TORCH_VER=${{ inputs.torch_version }}" >> $GITHUB_OUTPUT
+          echo "TORCH_CH=${{ inputs.torch_channel }}" >> $GITHUB_OUTPUT
+          echo "TRITON_LIST=${{ inputs.triton_candidates }}" >> $GITHUB_OUTPUT
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Tools
+        run: python -m pip install -U pip
+
+      - name: Create wheelhouse
+        run: mkdir -p wheelhouse
+
+      - name: Download Triton wheels (manylinux_2_35 first)
+        run: |
+          IFS=',' read -ra VS <<< "${{ steps.v.outputs.TRITON_LIST }}"
+          for tv in "${VS[@]}"; do
+            python -m pip download "triton==${tv}" \
+              --platform ${{ steps.v.outputs.PLAT1 }} \
+              --only-binary=:all: \
+              --implementation cp \
+              --python-version ${{ steps.v.outputs.PYTAG }} \
+              -d wheelhouse || true
+          done
+
+      - name: Fallback (manylinux2014)
+        run: |
+          IFS=',' read -ra VS <<< "${{ steps.v.outputs.TRITON_LIST }}"
+          for tv in "${VS[@]}"; do
+            python -m pip download "triton==${tv}" \
+              --platform ${{ steps.v.outputs.PLAT2 }} \
+              --only-binary=:all: \
+              --implementation cp \
+              --python-version ${{ steps.v.outputs.PYTAG }} \
+              -d wheelhouse || true
+          done
+
+      - name: (Optional) Download torch for smoke test
+        run: |
+          CH=${{ steps.v.outputs.TORCH_CH }}
+          TV=${{ steps.v.outputs.TORCH_VER }}
+          if [ "$CH" = "cpu" ]; then
+            python -m pip download "torch==${TV}" \
+              --platform ${{ steps.v.outputs.PLAT2 }} \
+              --only-binary=:all: --implementation cp \
+              --python-version ${{ steps.v.outputs.PYTAG }} \
+              -d wheelhouse
+          else
+            # cu128 官方索引
+            python -m pip download "torch==${TV}+${CH}" \
+              --index-url "https://download.pytorch.org/whl/${CH}" \
+              --platform ${{ steps.v.outputs.PLAT2 }} \
+              --only-binary=:all: --implementation cp \
+              --python-version ${{ steps.v.outputs.PYTAG }} \
+              -d wheelhouse || true
+          fi
+
+      - name: Add installer & README
+        run: |
+          cat > install_triton_runtime.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          WHEEL_DIR="${1:-wheelhouse}"
+          echo "[1/4] Install toolchain (Ubuntu/WSL)..."
+          sudo apt update
+          sudo apt install -y build-essential pkg-config || true
+          # 优先装较新的 clang/llvm
+          if apt-cache policy clang-18 >/dev/null 2>&1; then
+            sudo apt install -y clang-18 llvm-18 lld-18
+            export CC=/usr/bin/clang-18; export CXX=/usr/bin/clang++-18; export PATH=/usr/lib/llvm-18/bin:$PATH
+          elif apt-cache policy clang-16 >/dev/null 2>&1; then
+            sudo apt install -y clang-16 llvm-16 lld-16
+            export CC=/usr/bin/clang-16; export CXX=/usr/bin/clang++-16; export PATH=/usr/lib/llvm-16/bin:$PATH
+          else
+            sudo apt install -y clang llvm lld
+            export CC=$(command -v clang); export CXX=$(command -v clang++)
+          fi
+          echo "[2/4] Verify compiler:"
+          $CC --version | head -n1 || true
+
+          echo "[3/4] (Optional) install torch from local wheel if present"
+          if ls "$WHEEL_DIR"/torch-*.whl >/dev/null 2>&1; then
+            python -m pip install --no-index --find-links "$WHEEL_DIR" torch || true
+          fi
+
+          echo "[4/4] Try triton candidates until import OK..."
+          ok=""
+          for whl in $(ls "$WHEEL_DIR"/triton-*.whl 2>/dev/null | sort -Vr); do
+            echo " -> installing $(basename "$whl")"
+            if python -m pip install --no-index --find-links "$WHEEL_DIR" "$whl"; then
+              python - <<'PY' && ok="yes" || true
+import importlib
+m = importlib.import_module("triton")
+print("Imported Triton:", getattr(m, "__version__", "?"))
+PY
+              if [ "$ok" = "yes" ]; then
+                echo "Triton OK."; break
+              fi
+            fi
+          done
+          if [ -z "$ok" ]; then
+            echo "No triton candidate imported. Check Python/ABI/torch version." >&2
+            exit 1
+          fi
+
+          cat <<TIPS
+
+          Tips:
+          - Torch=CUDA 版 + 已安装 CUDA 12.8 (ptxas) 时，Triton/FA 才能走高性能 JIT。
+          - 若你只想先跑通、避免编译器：
+              export VLLM_USE_V1=1
+              export VLLM_PRIMITIVE_BACKEND=TORCH
+              unset VLLM_ATTENTION_BACKEND VLLM_USE_TRITON VLLM_USE_FLASH_ATTENTION VLLM_USE_FLASHINFER
+          - 建议安装 NVIDIA CUDA Toolkit 12.8（提供 ptxas），与驱动匹配更稳。
+          TIPS
+          SH
+          chmod +x install_triton_runtime.sh
+
+          cat > README_TRITON.txt <<'TXT'
+          # Offline Triton bundle (Linux x86_64, Python 3.11)
+          1) 解压：tar -xzf triton_wheels.tgz
+          2) 在 WSL/Ubuntu 激活你的 Python 环境（与 torch 2.8.0 匹配）
+          3) 执行：bash install_triton_runtime.sh wheelhouse
+          4) 验证：python -c "import triton; print('triton', triton.__version__)"
+          5) 想避免编译链：设置 VLLM_USE_V1=1 与 VLLM_PRIMITIVE_BACKEND=TORCH（见脚本提示）
+          6) 想用 triton/FA：确保 torch=CUDA 版；最好安装 CUDA Toolkit 12.8（ptxas）。
+          TXT
+
+      - name: Smoke test (offline import)
+        run: |
+          python -m venv /tmp/off && source /tmp/off/bin/activate
+          python -m pip install -U pip
+          # 如有 torch 就装，便于后续环境一致
+          python -m pip install --no-index --find-links wheelhouse torch || true
+          # 试装最高版本的 triton
+          set +e
+          for whl in $(ls wheelhouse/triton-*.whl 2>/dev/null | sort -Vr); do
+            python -m pip install --no-index --find-links wheelhouse "$whl" && break
+          done
+          python - <<'PY'
+try:
+    import triton
+    print("OK Triton", triton.__version__)
+except Exception as e:
+    print("Import failed:", e)
+PY
+
+      - name: Pack artifact
+        run: |
+          tar -czf triton_wheels.tgz wheelhouse install_triton_runtime.sh README_TRITON.txt
+          du -h triton_wheels.tgz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton_bundle_py${{ inputs.py_version }}_torch${{ inputs.torch_version }}_${{ inputs.torch_channel }}
+          path: |
+            triton_wheels.tgz
+            README_TRITON.txt
+            install_triton_runtime.sh
+          retention-days: 30
